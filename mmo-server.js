@@ -2,7 +2,6 @@ const express = require("express");
 const http = require("http");
 const { WebSocketServer, WebSocket } = require("ws");
 const cors = require("cors");
-const { createClient } = require("@supabase/supabase-js");
 
 const app = express();
 app.use(cors());
@@ -11,15 +10,10 @@ app.use(express.json());
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
-// ── Supabase ───────────────────────────────────────────────────────────
-const SUPABASE_URL = process.env.SUPABASE_URL || "https://paezlzjonablaseodpze.supabase.co";
-const SUPABASE_KEY = process.env.SUPABASE_KEY || "YOUR_ANON_KEY";
-const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
-
 // ══════════════════════════════════════════════════════════════════════
 //  WORLD GENERATION
-//  Die Welt wird einmalig generiert und in Supabase gespeichert.
-//  Beim Server-Start wird sie geladen – oder neu generiert falls keine existiert.
+//  Die Welt wird einmalig beim Server-Start generiert und im RAM gehalten.
+//  Bei einem Neustart des Servers wird eine neue Welt generiert.
 // ══════════════════════════════════════════════════════════════════════
 
 const WORLD_SIZE   = 200;   // Weltgröße in Einheiten
@@ -85,40 +79,14 @@ function generateWorld() {
     return world;
 }
 
-// Höhenmap-Funktion exportieren (für Spieler-Positionsvalidierung)
+// Höhenmap-Funktion (für Spieler-Positionsvalidierung)
 function getTerrainHeight(x, z) {
     return getHeight(x, z);
 }
 
-// ── Welt-State (im RAM, aus Supabase geladen) ──────────────────────────
-let WORLD = null;
-
-async function loadOrCreateWorld() {
-    try {
-        const { data, error } = await supabase
-            .from("mmo_world")
-            .select("*")
-            .eq("id", 1)
-            .single();
-
-        if (data && !error) {
-            WORLD = data.world_data;
-            console.log(`[WORLD] Aus Supabase geladen (generiert: ${new Date(WORLD.generatedAt).toLocaleString()})`);
-        } else {
-            throw new Error("Keine Welt in Supabase");
-        }
-    } catch (e) {
-        console.log("[WORLD] Generiere neue Welt...");
-        WORLD = generateWorld();
-        // In Supabase speichern
-        await supabase.from("mmo_world").upsert({
-            id: 1,
-            world_data: WORLD,
-            updated_at: new Date().toISOString()
-        });
-        console.log("[WORLD] Neue Welt in Supabase gespeichert");
-    }
-}
+// ── Welt-State (nur im RAM) ────────────────────────────────────────────
+let WORLD = generateWorld();
+console.log(`[WORLD] Welt bereit (generiert: ${new Date(WORLD.generatedAt).toLocaleString()})`);
 
 // ══════════════════════════════════════════════════════════════════════
 //  PLAYER MANAGEMENT
@@ -174,7 +142,7 @@ function broadcastAll(message) {
 
 wss.on("connection", (ws) => {
     const playerId = genPlayerId();
-    const spawnY = WORLD ? getTerrainHeight(0, 0) + 1.5 : 1.5;
+    const spawnY = getTerrainHeight(0, 0) + 1.5;
 
     const playerData = {
         id: playerId,
@@ -357,17 +325,16 @@ app.get("/", (req, res) => {
     res.json({
         status: "ok",
         players: players.size,
-        world: WORLD ? {
+        world: {
             size: WORLD.size,
             objects: WORLD.objects.length,
             generatedAt: WORLD.generatedAt
-        } : "wird geladen..."
+        }
     });
 });
 
 // Welt-Daten abrufen (für Clients die HTTP bevorzugen)
 app.get("/world", (req, res) => {
-    if (!WORLD) return res.status(503).json({ error: "Welt wird noch generiert" });
     res.json(WORLD);
 });
 
@@ -380,18 +347,14 @@ app.get("/players", (req, res) => {
 });
 
 // Welt zurücksetzen (nur für Admin)
-app.post("/reset-world", async (req, res) => {
+app.post("/reset-world", (req, res) => {
     const { secret } = req.body;
     if (secret !== process.env.ADMIN_SECRET) {
         return res.status(403).json({ error: "Nicht autorisiert" });
     }
     WORLD = generateWorld();
-    await supabase.from("mmo_world").upsert({
-        id: 1,
-        world_data: WORLD,
-        updated_at: new Date().toISOString()
-    });
     broadcastAll({ type: "world_reset", world: WORLD });
+    console.log("[WORLD] Welt manuell zurückgesetzt");
     res.json({ success: true, message: "Welt neu generiert" });
 });
 
@@ -401,28 +364,7 @@ app.post("/reset-world", async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 
-server.listen(PORT, async () => {
+server.listen(PORT, () => {
     console.log(`MMO Server läuft auf Port ${PORT}`);
-    await loadOrCreateWorld();
     console.log(`[READY] Server bereit für Verbindungen`);
 });
-
-// Spieler-Positionen alle 30 Sekunden in Supabase speichern
-setInterval(async () => {
-    if (players.size === 0) return;
-    const snapshot = Array.from(players.values()).map(({ data }) => ({
-        id: data.id,
-        name: data.name,
-        x: data.x, y: data.y, z: data.z,
-        color: data.color,
-        lastSeen: Date.now()
-    }));
-    try {
-        const { error } = await supabase.from("mmo_players_log").upsert(
-            snapshot.map(p => ({ player_id: p.id, data: p, updated_at: new Date().toISOString() }))
-        );
-        if (error) console.error("[DB] Spieler-Log Fehler:", error.message);
-    } catch(e) {
-        console.error("[DB] Spieler-Log Fehler:", e.message);
-    }
-}, 30000);
